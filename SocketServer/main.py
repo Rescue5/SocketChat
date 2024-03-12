@@ -3,12 +3,22 @@ import uuid
 import logging
 import time
 from typing import Dict
+from pydantic import BaseModel, ValidationError
+
+HOST = 'localhost'
+PORT = 5500
+
+
+class ClientMessage(BaseModel):
+    message: str
+
+class ServerMessage(BaseModel):
+    message: str
+
 
 PASSWORD = '112233'
-
-logging.basicConfig(level=logging.INFO, filename='server.log', format='%(levelname)s - %(asctime)s - %(lineno)d - %(message)s')
+logging.basicConfig(level=logging.INFO, filename='server.log', format="%(levelname)s - %(asctime)s - %(lineno)d - %(message)s")
 logger = logging.getLogger('server')
-
 client_dict: Dict[str, asyncio.StreamWriter] = {}
 
 
@@ -21,10 +31,10 @@ class SendRequestError(Exception):
     Attributes:
         message (str): Explanation of the error. Default is 'Message content cannot be blank'.
     """
+
     def __init__(self, message='Message content cannot be blank'):
         self.message = message
         super().__init__(self.message)
-
 
 
 class ClientRequestError(Exception):
@@ -36,6 +46,7 @@ class ClientRequestError(Exception):
     Attributes:
         message (str): Explanation of the error. Default is 'Request cannot be blank'.
     """
+
     def __init__(self, message='Request cannot be blank'):
         self.message = message
         super().__init__(self.message)
@@ -63,6 +74,7 @@ async def check_password(reader: asyncio.StreamReader, timeout: int = 30) -> boo
         return False
     received_password = data.decode().strip()
     return received_password == PASSWORD
+
 
 async def send_all(message: str, session_id: str) -> None:
     """
@@ -126,6 +138,39 @@ async def show_client(writer: asyncio.StreamWriter) -> None:
         await writer.drain()
 
 
+async def handle_client_message(message: str, session_id: str, writer: asyncio.StreamWriter, client_ip,
+                                client_port) -> None:
+    try:
+        if len(message) == 0:
+            raise ClientRequestError()
+
+        request_check = message.split()[0]
+        if request_check == 'send':
+            await send_all(message, session_id)
+        if request_check == 'sendto':
+            await send_to_client(message)
+        if request_check == 'disconnect':
+            raise asyncio.CancelledError()
+        if request_check == 'show_client':
+            await show_client(writer)
+        else:
+            raise ClientRequestError('Unknown request type')
+    except ClientRequestError as cre:
+        logger.error(cre)
+        error_message = f'Error: {str(cre)}\n'
+        writer.write(error_message.encode())
+        await writer.drain()
+    except SendRequestError as sre:
+        logger.error(sre)
+        error_message = f'Error: {str(sre)}\n'
+        writer.write(error_message.encode())
+        await writer.drain()
+    except asyncio.CancelledError:
+        writer.close()
+        await writer.wait_closed()
+        del client_dict[client_port]
+
+
 async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """
     This function serves as a callback that is called when a client connects to the server. It manages the lifecycle of
@@ -175,42 +220,19 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         while True:
             data = await reader.read(1024)
             message = data.decode()
+            client_message = ClientMessage(message=message)
             logger.info(f"Received request: {message} from {client_ip}:{client_port}")
-            if not data:
-                raise ClientRequestError()
-
-            request_check = message.split()[0]
-            if request_check == 'send':
-                await send_all(message, session_id)
-            elif request_check == 'sendto':
-                await send_to_client(message)
-            elif request_check == 'disconnect':
-                raise asyncio.CancelledError()
-            elif request_check == 'show_client':
-                await show_client(writer)
-    except ClientRequestError as cre:
-        logger.error(cre)
-        error_message = f'Error: {str(cre)}\n'
-        writer.write(error_message.encode())
-        await writer.drain()
-    except SendRequestError as sre:
-        logger.error(sre)
-        error_message = f'Error: {str(sre)}\n'
-        writer.write(error_message.encode())
-        await writer.drain()
+            await handle_client_message(client_message.message, session_id, writer, client_ip, client_port)
+    except ValidationError:
+        logger.error('Unvalidated request')
+        writer.write('Client message must be str'.encode())
     except asyncio.CancelledError:
-        writer.close()
-        await writer.wait_closed()
-        del client_dict[client_port]
-    finally:
         logger.info(f'Connection closed from {client_ip}:{client_port}')
         writer.write('Connection closed.'.encode())
         await writer.drain()
         writer.close()
         await writer.wait_closed()
         del client_dict[session_id]
-
-
 
 
 async def main():
@@ -223,9 +245,9 @@ async def main():
     No explicit return value but initializes and runs the server indefinitely until manually stopped or an unhandled
     exception occurs.
     """
-
     start_time = time.time()
-    server = await asyncio.start_server(client_connected_cb, 'localhost', 5500, reuse_address=True, reuse_port=True)
+    server = await asyncio.start_server(client_connected_cb, HOST, PORT, reuse_address=True,
+                                        reuse_port=True)
     logger.info('Server started')
     await server.serve_forever()
     elapsed_time = time.time() - start_time

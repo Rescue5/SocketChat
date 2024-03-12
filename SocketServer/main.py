@@ -17,8 +17,10 @@ class ServerMessage(BaseModel):
 
 
 PASSWORD = '112233'
-logging.basicConfig(level=logging.INFO, filename='server.log', format="%(levelname)s - %(asctime)s - %(lineno)d - %(message)s")
+logging.basicConfig(level=logging.INFO, filename='server.log',
+                    format="%(levelname)s - %(asctime)s - %(lineno)d - %(message)s")
 logger = logging.getLogger('server')
+open('server.log', 'w').close()
 client_dict: Dict[str, asyncio.StreamWriter] = {}
 
 
@@ -249,9 +251,13 @@ async def main():
     server = await asyncio.start_server(client_connected_cb, HOST, PORT, reuse_address=True,
                                         reuse_port=True)
     logger.info('Server started')
-    await server.serve_forever()
-    elapsed_time = time.time() - start_time
-    logger.info(f"Server was running for {elapsed_time} seconds")
+    try:
+        await server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info('Server stopped by user')
+    finally:
+        elapsed_time = time.time() - start_time
+        logger.info(f"Server was running for {round(elapsed_time)} seconds")
 
 
 if __name__ == '__main__':

@@ -1,12 +1,16 @@
 import asyncio
+import os
 import uuid
 import logging
 import time
 from typing import Dict
 from pydantic import BaseModel, ValidationError
+from dotenv import load_dotenv
 
-HOST = 'localhost'
-PORT = 5500
+load_dotenv('req.env')
+HOST = os.getenv('HOST')
+PORT = os.getenv('PORT')
+PASSWORD = os.getenv('PASSWORD')
 
 
 class ClientMessage(BaseModel):
@@ -16,7 +20,7 @@ class ServerMessage(BaseModel):
     message: str
 
 
-PASSWORD = '112233'
+
 logging.basicConfig(level=logging.INFO, filename='server.log',
                     format="%(levelname)s - %(asctime)s - %(lineno)d - %(message)s")
 logger = logging.getLogger('server')

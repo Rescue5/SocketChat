@@ -4,7 +4,7 @@ import uuid
 import logging
 import time
 from typing import Dict
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 from dotenv import load_dotenv
 
 load_dotenv('req.env')
@@ -13,12 +13,39 @@ PORT = os.getenv('PORT')
 PASSWORD = os.getenv('PASSWORD')
 
 
-class ClientMessage(BaseModel):
+class ClientSendMessage(BaseModel):
     message: str
+    split_message: list
+    split_message_len: int
 
-class ServerMessage(BaseModel):
+    @field_validator('split_message_len')
+    @classmethod
+    def check_split_message_len(cls, value):
+        if value == 1:
+            raise SendRequestError()
+        if value < 1:
+            raise ClientRequestError()
+        else:
+            return value
+
+
+class ClientSendToMessage(BaseModel):
     message: str
+    split_message: list
 
+    @field_validator('split_message')
+    @classmethod
+    def check_split_message(cls, value):
+        if len(value) == 2:
+            raise SendRequestError()
+        elif len(value) == 1:
+            raise SendRequestError('Sendto requires UUID')
+        elif len(value) < 1:
+            raise ClientRequestError()
+        elif len(value[1]) != 36:
+            raise SendRequestError('Incorrect UUID')
+        else:
+            return value
 
 
 logging.basicConfig(level=logging.INFO, filename='server.log',
@@ -93,11 +120,10 @@ async def send_all(message: str, session_id: str) -> None:
     Raises:
         SendRequestError: If the message is improperly formatted (e.g., message content is missing).
     """
-    if len(message.split(' ')) == 1:
-        raise SendRequestError()
-    response = message.split(' ')[1:]
-    response = ' '.join(response)
-    response = response.encode()
+    split_message = message.split()
+    split_message_len = len(split_message)
+    validation = ClientSendMessage(message=message, split_message=split_message, split_message_len=split_message_len)
+    response = f"{' '.join(validation.split_message[1:])} \n".encode('utf-8')
     for i in client_dict:
         if i != session_id:
             client_dict[i].write(response)
@@ -115,18 +141,12 @@ async def send_to_client(message: str) -> None:
         SendRequestError: If the message is improperly formatted, the specified session ID is not found, or the message
         content is missing.
     """
-    if len(message.split(' ')) == 1:
-        raise SendRequestError('Not enough arguments')
-    elif len(message.split(' ')) == 2:
-        raise SendRequestError('')
-    elif message.split(' ')[1] in client_dict:
-        response = message.split(' ')[2:]
-        response = ' '.join(response)
-        response = response.encode()
-        client_dict[message.split(' ')[1]].write(response)
-        await client_dict[message.split(' ')[1]].drain()
-    else:
-        raise SendRequestError('Incorrect UUID')
+    split_message = message.split()
+    validation = ClientSendToMessage(message=message, split_message=split_message)
+    response = f"{' '.join(validation.split_message[2:])} \n".encode('utf-8')
+    client_dict[split_message[1]].write(response)
+    await client_dict[split_message[1]].drain()
+
 
 
 async def show_client(writer: asyncio.StreamWriter) -> None:
@@ -147,17 +167,17 @@ async def show_client(writer: asyncio.StreamWriter) -> None:
 async def handle_client_message(message: str, session_id: str, writer: asyncio.StreamWriter, client_ip,
                                 client_port) -> None:
     try:
-        if len(message) == 0:
+        if not message:
             raise ClientRequestError()
 
         request_check = message.split()[0]
         if request_check == 'send':
             await send_all(message, session_id)
-        if request_check == 'sendto':
+        elif request_check == 'sendto':
             await send_to_client(message)
-        if request_check == 'disconnect':
+        elif request_check == 'disconnect':
             raise asyncio.CancelledError()
-        if request_check == 'show_client':
+        elif request_check == 'show_client':
             await show_client(writer)
         else:
             raise ClientRequestError('Unknown request type')
@@ -225,10 +245,15 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
     try:
         while True:
             data = await reader.read(1024)
+            if data.strip() == b'':
+                continue
             message = data.decode()
-            client_message = ClientMessage(message=message)
             logger.info(f"Received request: {message} from {client_ip}:{client_port}")
-            await handle_client_message(client_message.message, session_id, writer, client_ip, client_port)
+            await handle_client_message(message, session_id, writer, client_ip, client_port)
+    except ClientRequestError as cre:
+        logger.error(cre)
+        error_message = f'Error: {str(cre)}\n'
+        writer.write(error_message.encode())
     except ValidationError:
         logger.error('Unvalidated request')
         writer.write('Client message must be str'.encode())

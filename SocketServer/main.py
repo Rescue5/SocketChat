@@ -1,19 +1,23 @@
 import asyncio
 import os
 import uuid
+import ssl
 import logging
 import time
 from typing import Dict
 from pydantic import BaseModel, ValidationError, field_validator
 from dotenv import load_dotenv
 
+
 load_dotenv('req.env')
 HOST = os.getenv('HOST')
 PORT = os.getenv('PORT')
 PASSWORD = os.getenv('PASSWORD')
+CRT_PATH = os.getenv('CRT_PATH')
+KEY_PATH = os.getenv('KEY_PATH')
 
 
-class ClientSendMessage(BaseModel):
+class ClientSendRequest(BaseModel):
     message: str
     split_message: list
     split_message_len: int
@@ -29,7 +33,7 @@ class ClientSendMessage(BaseModel):
             return value
 
 
-class ClientSendToMessage(BaseModel):
+class ClientSendToRequest(BaseModel):
     message: str
     split_message: list
 
@@ -122,7 +126,7 @@ async def send_all(message: str, session_id: str) -> None:
     """
     split_message = message.split()
     split_message_len = len(split_message)
-    validation = ClientSendMessage(message=message, split_message=split_message, split_message_len=split_message_len)
+    validation = ClientSendRequest(message=message, split_message=split_message, split_message_len=split_message_len)
     response = f"{' '.join(validation.split_message[1:])} \n".encode('utf-8')
     for i in client_dict:
         if i != session_id:
@@ -142,7 +146,7 @@ async def send_to_client(message: str) -> None:
         content is missing.
     """
     split_message = message.split()
-    validation = ClientSendToMessage(message=message, split_message=split_message)
+    validation = ClientSendToRequest(message=message, split_message=split_message)
     response = f"{' '.join(validation.split_message[2:])} \n".encode('utf-8')
     client_dict[split_message[1]].write(response)
     await client_dict[split_message[1]].drain()
@@ -228,6 +232,9 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         - Logging is performed for connection events, received messages, and errors to aid in debugging and monitoring
             the server's operation.
     """
+    client_ip = 'unknown'
+    client_port = 'unknown'
+    session_id = 'unknown'
     writer.write('waiting for password\n'.encode())
     if await check_password(reader):
         writer.write('authenticated\n'.encode())
@@ -237,11 +244,22 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         writer.close()
         await writer.wait_closed()
 
-    global client_dict
-    client_ip, client_port = writer.get_extra_info('peername')
-    session_id = str(uuid.uuid4())
-    client_dict[session_id] = writer
-    logger.info(f'Connected from {client_ip}:{client_port}')
+    logger.info('client authenticated')
+    try:
+        client_info = writer.get_extra_info('peername')
+        client_info_str = ' - '.join(map(str, client_info))
+        logger.info(f'client info: {client_info_str}')
+        if len(client_info) == 2:  # IPv4
+            client_ip, client_port = client_info
+        elif len(client_info) == 4:  # IPv6
+            client_ip, client_port, _, _ = client_info
+        session_id = str(uuid.uuid4())
+        client_dict[session_id] = writer
+        logger.info(f'Connected from {client_ip}:{client_port}')
+    except Exception as e:
+        logger.error(f'Error getting client ip and port: {e}')
+        writer.close()
+        await writer.wait_closed()
     try:
         while True:
             data = await reader.read(1024)
@@ -264,6 +282,8 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         writer.close()
         await writer.wait_closed()
         del client_dict[session_id]
+    except KeyboardInterrupt:
+        raise
 
 
 async def main():
@@ -277,17 +297,33 @@ async def main():
     exception occurs.
     """
     start_time = time.time()
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(certfile=CRT_PATH, keyfile=KEY_PATH)
     server = await asyncio.start_server(client_connected_cb, HOST, PORT, reuse_address=True,
-                                        reuse_port=True)
-    logger.info('Server started')
+                                        reuse_port=True, ssl=ssl_context)
+    logger.info('Server started on {}:{}'.format(HOST, PORT))
+    print('Server started on {}:{}'.format(HOST, PORT))
     try:
         await server.serve_forever()
     except KeyboardInterrupt:
         logger.info('Server stopped by user')
     finally:
-        elapsed_time = time.time() - start_time
-        logger.info(f"Server was running for {round(elapsed_time)} seconds")
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+        logger.info(f"Server was running for {round(time.time() - start_time)} seconds")
+
+
+async def main_wrapper():
+    try:
+        await main()
+    except Exception as e:
+        logging.error(f"Unhandled exception: {e}", exc_info=True)
+        raise
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(main_wrapper())

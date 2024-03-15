@@ -1,24 +1,55 @@
 import asyncio
 import os
 import uuid
+import ssl
 import logging
 import time
 from typing import Dict
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 from dotenv import load_dotenv
+
 
 load_dotenv('req.env')
 HOST = os.getenv('HOST')
 PORT = os.getenv('PORT')
 PASSWORD = os.getenv('PASSWORD')
+CRT_PATH = os.getenv('CRT_PATH')
+KEY_PATH = os.getenv('KEY_PATH')
 
 
-class ClientMessage(BaseModel):
+class ClientSendRequest(BaseModel):
     message: str
+    split_message: list
+    split_message_len: int
 
-class ServerMessage(BaseModel):
+    @field_validator('split_message_len')
+    @classmethod
+    def check_split_message_len(cls, value):
+        if value == 1:
+            raise SendRequestError()
+        if value < 1:
+            raise ClientRequestError()
+        else:
+            return value
+
+
+class ClientSendToRequest(BaseModel):
     message: str
+    split_message: list
 
+    @field_validator('split_message')
+    @classmethod
+    def check_split_message(cls, value):
+        if len(value) == 2:
+            raise SendRequestError()
+        elif len(value) == 1:
+            raise SendRequestError('Sendto requires UUID')
+        elif len(value) < 1:
+            raise ClientRequestError()
+        elif len(value[1]) != 36:
+            raise SendRequestError('Incorrect UUID')
+        else:
+            return value
 
 
 logging.basicConfig(level=logging.INFO, filename='server.log',
@@ -93,11 +124,10 @@ async def send_all(message: str, session_id: str) -> None:
     Raises:
         SendRequestError: If the message is improperly formatted (e.g., message content is missing).
     """
-    if len(message.split(' ')) == 1:
-        raise SendRequestError()
-    response = message.split(' ')[1:]
-    response = ' '.join(response)
-    response = response.encode()
+    split_message = message.split()
+    split_message_len = len(split_message)
+    validation = ClientSendRequest(message=message, split_message=split_message, split_message_len=split_message_len)
+    response = f"{' '.join(validation.split_message[1:])} \n".encode('utf-8')
     for i in client_dict:
         if i != session_id:
             client_dict[i].write(response)
@@ -115,18 +145,12 @@ async def send_to_client(message: str) -> None:
         SendRequestError: If the message is improperly formatted, the specified session ID is not found, or the message
         content is missing.
     """
-    if len(message.split(' ')) == 1:
-        raise SendRequestError('Not enough arguments')
-    elif len(message.split(' ')) == 2:
-        raise SendRequestError('')
-    elif message.split(' ')[1] in client_dict:
-        response = message.split(' ')[2:]
-        response = ' '.join(response)
-        response = response.encode()
-        client_dict[message.split(' ')[1]].write(response)
-        await client_dict[message.split(' ')[1]].drain()
-    else:
-        raise SendRequestError('Incorrect UUID')
+    split_message = message.split()
+    validation = ClientSendToRequest(message=message, split_message=split_message)
+    response = f"{' '.join(validation.split_message[2:])} \n".encode('utf-8')
+    client_dict[split_message[1]].write(response)
+    await client_dict[split_message[1]].drain()
+
 
 
 async def show_client(writer: asyncio.StreamWriter) -> None:
@@ -147,17 +171,17 @@ async def show_client(writer: asyncio.StreamWriter) -> None:
 async def handle_client_message(message: str, session_id: str, writer: asyncio.StreamWriter, client_ip,
                                 client_port) -> None:
     try:
-        if len(message) == 0:
+        if not message:
             raise ClientRequestError()
 
         request_check = message.split()[0]
         if request_check == 'send':
             await send_all(message, session_id)
-        if request_check == 'sendto':
+        elif request_check == 'sendto':
             await send_to_client(message)
-        if request_check == 'disconnect':
+        elif request_check == 'disconnect':
             raise asyncio.CancelledError()
-        if request_check == 'show_client':
+        elif request_check == 'show_client':
             await show_client(writer)
         else:
             raise ClientRequestError('Unknown request type')
@@ -208,6 +232,9 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         - Logging is performed for connection events, received messages, and errors to aid in debugging and monitoring
             the server's operation.
     """
+    client_ip = 'unknown'
+    client_port = 'unknown'
+    session_id = 'unknown'
     writer.write('waiting for password\n'.encode())
     if await check_password(reader):
         writer.write('authenticated\n'.encode())
@@ -217,18 +244,34 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         writer.close()
         await writer.wait_closed()
 
-    global client_dict
-    client_ip, client_port = writer.get_extra_info('peername')
-    session_id = str(uuid.uuid4())
-    client_dict[session_id] = writer
-    logger.info(f'Connected from {client_ip}:{client_port}')
+    logger.info('client authenticated')
+    try:
+        client_info = writer.get_extra_info('peername')
+        client_info_str = ' - '.join(map(str, client_info))
+        logger.info(f'client info: {client_info_str}')
+        if len(client_info) == 2:  # IPv4
+            client_ip, client_port = client_info
+        elif len(client_info) == 4:  # IPv6
+            client_ip, client_port, _, _ = client_info
+        session_id = str(uuid.uuid4())
+        client_dict[session_id] = writer
+        logger.info(f'Connected from {client_ip}:{client_port}')
+    except Exception as e:
+        logger.error(f'Error getting client ip and port: {e}')
+        writer.close()
+        await writer.wait_closed()
     try:
         while True:
             data = await reader.read(1024)
+            if data.strip() == b'':
+                continue
             message = data.decode()
-            client_message = ClientMessage(message=message)
             logger.info(f"Received request: {message} from {client_ip}:{client_port}")
-            await handle_client_message(client_message.message, session_id, writer, client_ip, client_port)
+            await handle_client_message(message, session_id, writer, client_ip, client_port)
+    except ClientRequestError as cre:
+        logger.error(cre)
+        error_message = f'Error: {str(cre)}\n'
+        writer.write(error_message.encode())
     except ValidationError:
         logger.error('Unvalidated request')
         writer.write('Client message must be str'.encode())
@@ -239,6 +282,8 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         writer.close()
         await writer.wait_closed()
         del client_dict[session_id]
+    except KeyboardInterrupt:
+        raise
 
 
 async def main():
@@ -252,17 +297,33 @@ async def main():
     exception occurs.
     """
     start_time = time.time()
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(certfile=CRT_PATH, keyfile=KEY_PATH)
     server = await asyncio.start_server(client_connected_cb, HOST, PORT, reuse_address=True,
-                                        reuse_port=True)
-    logger.info('Server started')
+                                        reuse_port=True, ssl=ssl_context)
+    logger.info('Server started on {}:{}'.format(HOST, PORT))
+    print('Server started on {}:{}'.format(HOST, PORT))
     try:
         await server.serve_forever()
     except KeyboardInterrupt:
         logger.info('Server stopped by user')
     finally:
-        elapsed_time = time.time() - start_time
-        logger.info(f"Server was running for {round(elapsed_time)} seconds")
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+        logger.info(f"Server was running for {round(time.time() - start_time)} seconds")
+
+
+async def main_wrapper():
+    try:
+        await main()
+    except Exception as e:
+        logging.error(f"Unhandled exception: {e}", exc_info=True)
+        raise
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(main_wrapper())

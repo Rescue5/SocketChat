@@ -1,3 +1,5 @@
+# Ошибка отключение клиента через keyboard interrupt - предположительно строка 168
+
 import asyncio
 import os
 import uuid
@@ -5,9 +7,10 @@ import ssl
 import logging
 import time
 from typing import Dict
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import ValidationError
 from dotenv import load_dotenv
-
+from client_requests import send_to_client, show_client, send_all, info
+from exceptions import ClientRequestError, SendRequestError, ClientCloseConnection
 
 load_dotenv('req.env')
 HOST = os.getenv('HOST')
@@ -16,77 +19,11 @@ PASSWORD = os.getenv('PASSWORD')
 CRT_PATH = os.getenv('CRT_PATH')
 KEY_PATH = os.getenv('KEY_PATH')
 
-
-class ClientSendRequest(BaseModel):
-    message: str
-    split_message: list
-    split_message_len: int
-
-    @field_validator('split_message_len')
-    @classmethod
-    def check_split_message_len(cls, value):
-        if value == 1:
-            raise SendRequestError()
-        if value < 1:
-            raise ClientRequestError()
-        else:
-            return value
-
-
-class ClientSendToRequest(BaseModel):
-    message: str
-    split_message: list
-
-    @field_validator('split_message')
-    @classmethod
-    def check_split_message(cls, value):
-        if len(value) == 2:
-            raise SendRequestError()
-        elif len(value) == 1:
-            raise SendRequestError('Sendto requires UUID')
-        elif len(value) < 1:
-            raise ClientRequestError()
-        elif len(value[1]) != 36:
-            raise SendRequestError('Incorrect UUID')
-        else:
-            return value
-
-
 logging.basicConfig(level=logging.INFO, filename='server.log',
                     format="%(levelname)s - %(asctime)s - %(lineno)d - %(message)s")
 logger = logging.getLogger('server')
 open('server.log', 'w').close()
 client_dict: Dict[str, asyncio.StreamWriter] = {}
-
-
-class SendRequestError(Exception):
-    """
-    Exception raised when there is an issue with sending a request.
-
-    This can occur if the message content is blank or improperly formatted for the intended send operation.
-
-    Attributes:
-        message (str): Explanation of the error. Default is 'Message content cannot be blank'.
-    """
-
-    def __init__(self, message='Message content cannot be blank'):
-        self.message = message
-        super().__init__(self.message)
-
-
-class ClientRequestError(Exception):
-    """
-    Exception raised when there is an issue with the client's request.
-
-    This may happen if the request from the client is blank or does not adhere to expected formats.
-
-    Attributes:
-        message (str): Explanation of the error. Default is 'Request cannot be blank'.
-    """
-
-    def __init__(self, message='Request cannot be blank'):
-        self.message = message
-        super().__init__(self.message)
 
 
 async def check_password(reader: asyncio.StreamReader, timeout: int = 30) -> bool:
@@ -105,67 +42,13 @@ async def check_password(reader: asyncio.StreamReader, timeout: int = 30) -> boo
     Raises:
         asyncio.TimeoutError: If no data is received within the given timeout period.
     """
+    global client_dict
     try:
         data = await asyncio.wait_for(reader.read(100), timeout)
     except asyncio.TimeoutError:
         return False
     received_password = data.decode().strip()
     return received_password == PASSWORD
-
-
-async def send_all(message: str, session_id: str) -> None:
-    """
-    Broadcasts a message to all connected clients except the sender.
-
-    Args:
-        message (str): The message to be sent, expected to follow the format "send <message>".
-        session_id (str): The session ID of the client sending the message, to exclude them from the recipients.
-
-    Raises:
-        SendRequestError: If the message is improperly formatted (e.g., message content is missing).
-    """
-    split_message = message.split()
-    split_message_len = len(split_message)
-    validation = ClientSendRequest(message=message, split_message=split_message, split_message_len=split_message_len)
-    response = f"{' '.join(validation.split_message[1:])} \n".encode('utf-8')
-    for i in client_dict:
-        if i != session_id:
-            client_dict[i].write(response)
-            await client_dict[i].drain()
-
-
-async def send_to_client(message: str) -> None:
-    """
-    Sends a message to a specific client identified by their session ID.
-
-    Args:
-        message (str): The message string to be sent, expected to follow the format "sendto <uuid> <message>".
-
-    Raises:
-        SendRequestError: If the message is improperly formatted, the specified session ID is not found, or the message
-        content is missing.
-    """
-    split_message = message.split()
-    validation = ClientSendToRequest(message=message, split_message=split_message)
-    response = f"{' '.join(validation.split_message[2:])} \n".encode('utf-8')
-    client_dict[split_message[1]].write(response)
-    await client_dict[split_message[1]].drain()
-
-
-
-async def show_client(writer: asyncio.StreamWriter) -> None:
-    """
-    Sends a list of currently connected client IDs to the requester.
-
-    Args:
-        writer (asyncio.StreamWriter): The StreamWriter object associated with the client requesting the list of
-        connected clients.
-
-    This function generates no return value but sends data directly to the client through the provided StreamWriter.
-    """
-    for i in client_dict:
-        writer.write(f'{str(i)}\n'.encode())
-        await writer.drain()
 
 
 async def handle_client_message(message: str, session_id: str, writer: asyncio.StreamWriter, client_ip,
@@ -176,13 +59,15 @@ async def handle_client_message(message: str, session_id: str, writer: asyncio.S
 
         request_check = message.split()[0]
         if request_check == 'send':
-            await send_all(message, session_id)
+            await send_all(message, session_id, client_dict)
         elif request_check == 'sendto':
-            await send_to_client(message)
+            await send_to_client(message, client_dict)
         elif request_check == 'disconnect':
             raise asyncio.CancelledError()
         elif request_check == 'show_client':
-            await show_client(writer)
+            await show_client(writer, client_dict)
+        elif request_check == 'info':
+            await info(writer)
         else:
             raise ClientRequestError('Unknown request type')
     except ClientRequestError as cre:
@@ -196,6 +81,9 @@ async def handle_client_message(message: str, session_id: str, writer: asyncio.S
         writer.write(error_message.encode())
         await writer.drain()
     except asyncio.CancelledError:
+        writer.write('You will be disconnected'.encode())
+        await writer.drain()
+        del (client_dict[session_id])
         writer.close()
         await writer.wait_closed()
         del client_dict[client_port]
@@ -265,6 +153,9 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
             data = await reader.read(1024)
             if data.strip() == b'':
                 continue
+            if not data:
+                logger.info(f"Client {client_ip}:{client_port} disconnected")
+                raise ClientCloseConnection()
             message = data.decode()
             logger.info(f"Received request: {message} from {client_ip}:{client_port}")
             await handle_client_message(message, session_id, writer, client_ip, client_port)
@@ -282,8 +173,11 @@ async def client_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         writer.close()
         await writer.wait_closed()
         del client_dict[session_id]
-    except KeyboardInterrupt:
-        raise
+    except ClientCloseConnection:
+        writer.close()
+        await writer.wait_closed()
+    except Exception as e:
+        logger.exception(e)
 
 
 async def main():
